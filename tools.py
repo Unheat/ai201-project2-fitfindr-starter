@@ -181,7 +181,8 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             ],
             temperature=TEMPERATURE
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        return content if content is not None else "I'm having trouble connecting to my styling engine right now. Please try again later."
     except Exception as e:
         # Graceful degradation if the API fails
         return "I'm having trouble connecting to my styling engine right now. Please try again later."
@@ -239,7 +240,8 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
             ],
             temperature=TEMPERATURE
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        return content if content is not None else "I'm having trouble connecting to my styling engine right now. Please try again later."
     except Exception as e:
         # Graceful degradation if the API fails
-        return "I'm having trouble connecting to my styling engine right now. Please try again later. "
+        return "I'm having trouble connecting to my styling engine right now. Please try again later."

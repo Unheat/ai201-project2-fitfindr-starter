@@ -70,30 +70,40 @@ Uses an LLM to generate a short, catchy, and shareable social media caption (a "
 ### Additional Tools (if any)
 
 <!-- Copy the block above for any tools beyond the required three -->
-
+-history: the agent can look at chat history to extract user information such as size, styles,...
 ---
 
 ## Planning Loop
 
-**How does your agent decide which tool to call next?**
-The planning loop should behave like a simple decision tree, not a fixed script:
+> **Implementation note:** the original plan below was a Python-driven fixed sequence. The
+> actual implementation in `run_agent()` is an **LLM tool-calling loop** — the model decides
+> which tools to call (and parses the query into tool arguments itself). The behavior is the
+> same decision tree, but the *decisions are made by the LLM*, not by hardcoded `if` statements.
 
-1. Start with the raw user query and create a fresh session dict.
-2. Parse the query into three values:
-   - `description`: the main item description (for example, "vintage graphic tee")
-   - `size`: the size mentioned in the query, or `None` if no size is given
-   - `max_price`: the budget mentioned in the query, or `None` if no price is given
-3. Call `search_listings(description, size, max_price)`.
-4. If the returned list is empty, set `session["error"]` to a helpful message and stop immediately. Do not call `suggest_outfit` or `create_fit_card`.
-5. If the list is not empty, store the top result in `session["selected_item"]` and call `suggest_outfit(selected_item, wardrobe)`.
-6. Save the returned outfit suggestion in `session["outfit_suggestion"]`.
-7. If the suggestion is empty or looks invalid, set a fallback message in the session and still continue to `create_fit_card` only if there is enough data to make a caption.
-8. Call `create_fit_card(outfit_suggestion, selected_item)` and save the result in `session["fit_card"]`.
-9. Return the session. The loop ends when either:
-   - a tool returns no useful result and the agent chooses to stop, or
-   - all three tools have completed successfully.
+**How does the agent decide which tool to call next?**
+The loop behaves like a decision tree driven by user intent, not a fixed script:
 
-This loop is correct because it changes behavior based on the actual result of `search_listings`, instead of always running all tools in the same order.
+1. Start with the raw user query and create a fresh session dict (reusing prior `chat_history`
+   if this is a follow-up turn).
+2. Send the message history + the three tool definitions to the LLM with `tool_choice="auto"`.
+   The system prompt and tool descriptions instruct the model to call **only the tools the user
+   actually asked for**. The model also extracts `description`, `size`, and `max_price` from the
+   query as arguments to `search_listings` — there is no separate Python parsing step.
+3. If the model returns plain text instead of a tool call, that is the final answer → store it in
+   `session["final_reply"]` and stop.
+4. If the model calls tools, dispatch each one through `dispatch_tool()`, append the JSON results
+   to the message history, and loop again so the model can react to what came back.
+5. `search_listings` returning `[]` is fed back to the model, which then replies with a helpful
+   no-results message and stops — it does not invent an item or proceed to styling.
+6. `suggest_outfit` runs only when the user asked for styling (and only after a search result
+   exists). `create_fit_card` runs only when the user asked for a caption (and only after an
+   outfit exists). These ordering rules are enforced both by the prompt and by guards in
+   `dispatch_tool()`.
+7. The loop ends when the model gives a final text reply, or after `MAX_TOOL_ROUNDS` (10) as a
+   runaway guard.
+
+This is a real decision tree: the same starting query can call one, two, or three tools depending
+on what the user requested and on whether each prior step produced usable data.
 
 ---
 
@@ -104,22 +114,23 @@ The session dict is the single source of truth for one interaction. It stores th
 
 Key state fields:
 - `query`: the user’s original text
-- `parsed`: the extracted `description`, `size`, and `max_price`
+- `messages`: the full LLM conversation (system + user + assistant + tool results); this carries chat history across turns
+- `parsed`: reserved field — **unused in the final implementation** because the LLM extracts the search arguments directly
 - `search_results`: the full list returned by `search_listings`
 - `selected_item`: the top listing chosen to style next
 - `wardrobe`: the wardrobe passed into the session
 - `outfit_suggestion`: the result from `suggest_outfit`
 - `fit_card`: the final caption from `create_fit_card`
-- `error`: a fallback message if the run stops early
+- `final_reply`: the model's closing text answer
+- `error`: only set if the loop hits `MAX_TOOL_ROUNDS` without a final reply (safety net)
 
-The flow works like this:
-1. `search_listings` writes results into `search_results`.
-2. The first result is copied into `selected_item`.
-3. `selected_item` is passed directly into `suggest_outfit`.
-4. The outfit string returned by `suggest_outfit` is stored in `outfit_suggestion`.
-5. `outfit_suggestion` and `selected_item` are both passed into `create_fit_card`.
+The flow works like this (the dispatcher injects state so the model never re-supplies data):
+1. The LLM calls `search_listings` with arguments it parsed from the query; `dispatch_tool` writes results into `search_results` and copies the top result into `selected_item`.
+2. The LLM calls `suggest_outfit` **with no arguments** — the dispatcher injects `selected_item` and `wardrobe` from the session.
+3. The outfit string returned by `suggest_outfit` is stored in `outfit_suggestion`.
+4. The LLM calls `create_fit_card` with the outfit text; the dispatcher pairs it with the saved `selected_item` and stores the caption in `fit_card`.
 
-This means the agent does not ask the user to re-enter the listing or outfit details between steps.
+This means the agent does not ask the user — or the model — to re-enter the listing or outfit details between steps; the session guarantees the right item is carried forward.
 
 ---
 
@@ -127,13 +138,15 @@ This means the agent does not ask the user to re-enter the listing or outfit det
 
 For each tool, describe the specific failure mode you're handling and what the agent does in response.
 
-| Tool | Failure mode | Agent response |
+| Tool | Failure mode | Agent response (as actually implemented) |
 |------|-------------|----------------|
-| search_listings | No results match the query | Return a clear message such as: “I could not find any vintage graphic tees under $30 in size M. Try increasing the budget or removing the size filter.” Store that message in `session["error"]` and stop the loop. |
-| suggest_outfit | Wardrobe is empty or has no useful items | Return a general styling suggestion based only on the selected item, instead of crashing. If the wardrobe is empty, say: “Your wardrobe is empty, so I’m giving you a general outfit idea based on the item itself.” |
-| create_fit_card | Outfit input is missing or incomplete | Return a safe fallback message such as: “I cannot generate a fit card yet because the outfit suggestion is missing.” Do not call the LLM with an empty string. |
+| search_listings | No results match the query | Returns `[]`. The empty list is fed back to the LLM, which replies with a specific no-results message and stops — it does not style or invent an item. (Observed: `designer ballgown size XXS under $5` → "No designer ballgowns in size XXS were found under $5." `session["error"]` stays `None`; the message is the LLM's reply.) |
+| suggest_outfit | Wardrobe is empty or has no useful items | Detects the empty `items` list and switches to a general-styling prompt built around universal basics, instead of crashing. (Observed: empty wardrobe + 90s track jacket → advice pairing it with a plain white tee, blue jeans, and neutral sneakers.) |
+| suggest_outfit / create_fit_card | Called before an item is selected | `dispatch_tool` guards on `session["selected_item"]` and returns `{"error": ...}` instead of calling the LLM with nothing. |
+| create_fit_card | Outfit input is empty/whitespace | Returns a safe fallback string before any API call. Does not call the LLM with an empty string. |
+| run_agent loop | `MAX_TOOL_ROUNDS` reached with no reply | Sets `session["error"]` so the UI can surface a clear failure. |
 
-These responses should be specific, friendly, and useful, not just “error occurred.”
+These responses are specific, friendly, and useful, not just “error occurred.”
 
 ---
 
@@ -143,35 +156,42 @@ These responses should be specific, friendly, and useful, not just “error occu
 User query
     │
     ▼
-Planning Loop
+LLM tool-calling loop (tool_choice="auto")  ── model decides which tools to call
     │
-    ├──> search_listings(description, size, max_price)
+    ├──> search_listings(description, size, max_price)   [LLM parses the args]
     │        │
-    │        ├── no results ──> set session["error"] ──> stop
+    │        ├── [] (no results) ──> LLM replies "nothing found" ──> stop
     │        │
-    │        └── results found ──> store session["search_results"]
-    │                                  store session["selected_item"]
+    │        └── results found ──> store search_results
+    │                                store selected_item (top hit)
     │
-    ├──> suggest_outfit(selected_item, wardrobe)
-    │        │
-    │        └── store session["outfit_suggestion"]
+    ├──> suggest_outfit()   ONLY if user asked for styling
+    │        │              (dispatcher injects selected_item + wardrobe)
+    │        └── store outfit_suggestion
     │
-    └──> create_fit_card(outfit_suggestion, selected_item)
-             │
-             └── store session["fit_card"]
+    └──> create_fit_card(outfit)   ONLY if user asked for a caption
+             │                     (dispatcher injects selected_item)
+             └── store fit_card
+    │
+    ▼
+final_reply (LLM's closing text)
 
 Session / State
     ├── query
-    ├── parsed
+    ├── messages          (LLM conversation + history)
+    ├── parsed            (reserved, unused — LLM parses instead)
     ├── search_results
     ├── selected_item
     ├── wardrobe
     ├── outfit_suggestion
     ├── fit_card
-    └── error
+    ├── final_reply
+    └── error             (only on MAX_TOOL_ROUNDS exhaustion)
 ```
 
-This diagram shows the decision path clearly: the search step decides whether the agent continues, and the session dict carries data into the next tool call.
+This diagram shows the decision path clearly: the LLM chooses tools based on user intent, the
+search step decides whether the agent can continue, and the session dict carries data forward so
+the model never re-supplies it.
 
 ---
 
@@ -197,26 +217,29 @@ This plan is useful because it asks the AI to generate code only after the behav
 
 Write out what a full user interaction looks like from start to finish — tool call by tool call. Use a specific example query.
 
-**Example user query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers. What's out there and how would I style it?"
+**Example user query (real run):** "find a vintage graphic tee under $30, suggest an outfit, then make me a fit card"
 
 **Step 1:**
-The agent parses the query into:
-- `description = "vintage graphic tee"`
-- `size = None`
-- `max_price = 30`
-
-It then calls `search_listings("vintage graphic tee", None, 30)` and gets a list of matching thrift listings.
+The LLM decides to call `search_listings`, parsing the query into the arguments
+`{'description': 'vintage graphic tee', 'max_price': 30}` (no size given). The dispatcher runs the
+search, stores the hits in `search_results`, and copies the top hit —
+*Y2K Baby Tee — Butterfly Print ($18)* — into `selected_item`.
 
 **Step 2:**
-The top listing is stored in `session["selected_item"]`. The agent then calls `suggest_outfit(selected_item, wardrobe)` using the user’s wardrobe items as styling context.
+Because the user asked for styling, the LLM calls `suggest_outfit()` with no arguments; the
+dispatcher injects `selected_item` and the wardrobe. The returned outfit ideas (e.g. the Y2K tee
+with baggy straight-leg jeans + chunky white sneakers, or layered under a cropped hoodie with
+combat boots) are stored in `outfit_suggestion`.
 
 **Step 3:**
-The outfit suggestion is stored in `session["outfit_suggestion"]`. The agent then calls `create_fit_card(outfit_suggestion, selected_item)` to turn the outfit advice into a short social-media caption.
+Because the user asked for a caption, the LLM calls `create_fit_card(outfit)`; the dispatcher
+pairs it with `selected_item` and stores the caption in `fit_card`.
 
 **Final output to user:**
-The user sees three things:
-1. the top thrift listing found
-2. one or more outfit ideas based on their wardrobe
-3. a short fit card caption they could post or share
+The three panels populate with the top listing, the outfit ideas, and the shareable caption.
 
-If the search step had returned no results, the agent would stop after Step 1 and show a helpful error message instead of continuing.
+**Contrast — a shorter query:** for just `vintage graphic tee under $30`, the agent calls
+`search_listings` **only** and returns the listings; it does not run styling or caption tools
+because the user didn't ask for them. And if the search returns no results
+(`designer ballgown size XXS under $5`), the agent stops after the search and replies with a
+helpful no-results message instead of continuing.
